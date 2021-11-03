@@ -1,57 +1,8 @@
-#!/usr/bin/env python3
-
-# information may be at: (and i haven't reviewed most of this)
-#  https://web.archive.org/web/20190515215627/http://android.choosemuse.com/index.html
-#  https://sites.google.com/a/interaxon.ca/muse-developer-site/home
-    # these were the control commands in 2015: https://sites.google.com/a/interaxon.ca/muse-developer-site/muse-communication-protocol/serial-commands
-#  https://web.archive.org/web/20180102133124/http://developer.choosemuse.com/hardware-firmware
-
-# preset information from web (may be more from museio binaries):
-# Preset ID   EEG Channels    EEG Data    Accelerometer Data  Notch Filter    Compression Battery/Temp Data   Error Data  DRL/REF Data
-# consumer 2014
-# 10  TP9, AF7, AF8, TP10 10 bits @ 220Hz None    60Hz    ON  None    None    None
-# 12  TP9, AF7, AF8, TP10 10 bits @ 220Hz 50Hz    60Hz    ON  0.1Hz   None    None
-# 14  TP9, AF7, AF8, TP10 10 bits @ 220Hz 50Hz    60Hz    ON  0.1Hz   Real-time   10bit @ 10Hz
-# research 2014
-# AB  TP9, AF7, AF8, TP10, Left AUX, Right AUX    16 bits @ 500Hz 50Hz    OFF OFF 0.1Hz   None    None
-# AD  TP9, AF7, AF8, TP10 16 bits @ 500Hz 50Hz    OFF OFF 0.1Hz   None    None
-# consumer 2016
-# 21  TP9, AF7, AF8, TP10 12 bits @ 256Hz 52Hz    None    OFF 0.1Hz   None    12 bits @ 32Hz
-# 22  TP9, AF7, AF8, TP10 12 bits @ 256Hz None    None    OFF 0.1Hz   None    12 bits @ 32Hz
-# 23  TP9, AF7, AF8, TP10 12 bits @ 256Hz None    None    OFF 0.1Hz   None    12 bits @ 32Hz
-
-# the official meditation app contains a number of presets in its 2020 binary:
-# note the preset numbers are in hexadecimal, and are returned in json decimal in the status command
-# enum {
-#   PRESET_10; # muse 1, 2014, 2016
-#   PRESET_12;
-#   PRESET_14;
-#   PRESET_20; # muse 2, muse S
-#   PRESET_21;
-#   PRESET_22;
-#   PRESET_23;
-#   PRESET_31; # unknown
-#   PRESET_32;
-#   PRESET_50; # these all worked on my muse S
-#   PRESET_51;
-#   PRESET_52;
-#   PRESET_53;   # this ones places it into a different runstate, maybe bootloaderish
-#   PRESET_60;
-#   PRESET_61;
-#   PRESET_63;
-#   PRESET_AB; # muse 1, reseach
-#   PRESET_AD;
-# }
-
-
-# muse 2, btle gatt
 MUSE_MAC_PREFIX = '00:55:DA:'
 PRIMARY_SERVICE = '0000fe8d-0000-1000-8000-00805f9b34fb'
 CHARACTERISTIC_UUID_TEMPLATE = '273e00{}-4c4d-454d-96be-f03bac821358'
-
+EOL = '\n'
 GATT_CHARACTERISTIC_IDS = {
-    # i'm not sure these names have the right numbers
-    # the presets are associated with the numbers, not the names, on my Muse S
     'SERIAL': 1,
     # packets start with a 16-bit sequence number
     # eeg signals are all 12-bit numbers concatenated together
@@ -86,13 +37,25 @@ GATT_CHARACTERISTIC_UUIDS = {
 # muse 1, not implemented, rfcomm sdp
 SPP_UUID = '00001101-0000-1000-8000-00805F9B34FB'
 
-def _encode_command(cmd : str):
-    return [len(cmd) + 1, *(ord(char) for char in cmd), ord('\n')]
 
 print('importing ...')
+
 import bt_bleak as bt
 import json
 import threading
+import socket
+import time
+
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+
+# Enable broadcasting mode
+server.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+# Set a timeout so the socket does not block
+# indefinitely when trying to receive data.
+server.settimeout(0.2)
+
 iface = bt.interfaces()[0]
 print('scanning for muses ...')
 devices = None
@@ -115,13 +78,16 @@ iface.start_scanning(update)
 devices = [iface.device(mac) for mac in devices]
 devices = [device for device in devices if device]
 print('found {}'.format([device.info() for device in devices]))
-#print('connecting to {} ...'.format(devices[0]))
-#device = bt.LEDevice(iface, devices[0])
+try:
+    print('connecting to {} ...'.format(devices[0]))
+except:
+    print("Failed")
+    exit()
 device = devices[0]
 print('connected to {}'.format(device.info()))
 
-from fractions import Fraction
-
+# from fractions import Fraction
+import json
 
 class Bits12:
     def __init__(self, device, name):
@@ -129,34 +95,48 @@ class Bits12:
         self._characteristic = GATT_CHARACTERISTIC_UUIDS[name]
         self._gatt = device.characteristic(PRIMARY_SERVICE, self._characteristic)
         self._gatt.subscribe(self._recv)
+        print("Broadcasting", name)
+
     def _recv(self, data : bytes):
+        # First two bytes represent the sequence number which is an unsigned int.
         seq = int.from_bytes(data[0:2], 'big', signed=False)
+
         samples = []
         for i in range(2, len(data), 3):
             # two 12-bit values made out of three 8-bit values
             samples.append(data[i] << 4 | data[i + 1] >> 4)
             samples.append((data[i + 1] & 0xf) << 8 | data[i + 2])
-        samples = [Fraction((sample - 0x800) * 125, 256) for sample in samples]
-        print(self._name, {
+        samples = [((sample - 0x800) * 125)/ 256 for sample in samples]
+        
+        server.sendto((json.dumps({
+            'name': self._name,
+            'timestamp': time.time(),
             'seq': seq,
             'samples': [float(sample) for sample in samples],
-        })
+        })+EOL).encode('utf-8'), ('<broadcast>', 37020))
+
+
 class Bits24:
     def __init__(self, device, name):
         self._name = name
         self._characteristic = GATT_CHARACTERISTIC_UUIDS[name]
         self._gatt = device.characteristic(PRIMARY_SERVICE, self._characteristic)
         self._gatt.subscribe(self._recv)
+        print("Broadcasting", name)
+
     def _recv(self, data : bytes):
         seq = int.from_bytes(data[0:2], 'big', signed=False)
         samples = []
         for i in range(2, len(data), 3):
             samples.append(int.from_bytes(data[i:i+3], 'big', signed=False))
-        #samples = [Fraction((sample * numerator, denominator) for sample in samples]
-        print(self._name, {
+
+        server.sendto((json.dumps({
+            'name': self._name,
             'seq': seq,
-            'samples': [sample for sample in samples],
-        })
+            'timestamp': time.time(),
+            'samples': [float(sample) for sample in samples],
+        })+EOL).encode('utf-8'), ('<broadcast>', 37020))
+
 class Imu:
     def __init__(self, device, name, characteristic, scale):
         self._scale = scale
@@ -165,6 +145,9 @@ class Imu:
         self._gatt = device.characteristic(PRIMARY_SERVICE, characteristic)
         self._gatt.subscribe(self._recv)
         self._accum = []
+
+        print("Broadcasting", name)
+
     def _vector(self, data : bytes):
         return [
             int.from_bytes(data[0:2], 'big', signed=True) * self._scale,
@@ -174,25 +157,18 @@ class Imu:
     def _recv(self, data : bytes):
         seq = int.from_bytes(data[0:2], 'big', signed=False)
         samples = [self._vector(data[2:8]), self._vector(data[8:14]), self._vector(data[14:20])]
-        #self._accum.extend(samples)
-        #if (len(self._accum) > 24):
-        #    avg = []
-        #    for a in range(len(self._accum[0])):
-        #        total = 0
-        #        for sample in self._accum:
-        #            total += sample[a]
-        #        avg.append(total / len(self._accum))
-        #    self._accum = []
-        print('imu', self._name, {
+
+        server.sendto((json.dumps({
+            'name': self._name,
             'seq': seq,
-            'samples': [[float(coord) for coord in sample] for sample in samples]
-            #'avg': [float(coord) for coord in avg]
-        })
+            'timestamp': time.time(),
+            'samples': [sample for sample in samples],
+        })+EOL).encode('utf-8'), ('<broadcast>', 37020))
+
 class Accelerometer(Imu):
-    # DONE FOR NOW
     def __init__(self, device):
         # result is in G's, proportion of gravity at sea level
-        super().__init__(device, 'accelerometer', GATT_CHARACTERISTIC_UUIDS['ACCELEROMETER'], Fraction(1, 16384))
+        super().__init__(device, 'accelerometer', GATT_CHARACTERISTIC_UUIDS['ACCELEROMETER'], 1/16384)
 
 # what model is the IMU to verify these units?
 class Gyroscope(Imu):
@@ -201,41 +177,7 @@ class Gyroscope(Imu):
             # i'm not sure where this decimal comes from.
             # it's in the muse-js source code.  it doesn't multiply out to an integral
             # number of degrees, or units per 16-bit value, or anything.
-        super().__init__(device, 'gyroscope', GATT_CHARACTERISTIC_UUIDS['GYRO'], Fraction(0.0074768))
-        
-class ChannelProbe:
-    def __init__(self, device, name):
-        self._name = name
-        self._gatt = device.characteristic(PRIMARY_SERVICE, GATT_CHARACTERISTIC_UUIDS[name])
-        self._gatt.subscribe(self._recv)
-
-    def probe(self, ctrl, presets):
-        result = []
-        for preset in presets:
-            ctrl.send('v1') # versions
-            ctrl.send(preset) # preset
-            ctrl.send('s') # status
-            self._received = None
-            ctrl.send('d') # data
-            bt_bluezero._pumploop.add_timer(10000, bt_bluezero.stop_pump)
-            bt_bluezero.pump()
-            ctrl.send('h') # halt
-            if self._received:
-                result.append(preset)
-            else:
-                print('no', preset, self._name)
-        #self._gatt.unsubscribe()
-        return result
-    def _recv(self, data : bytes):
-        self._received = data
-
-class Debug:
-    def __init__(self, device, name):
-        self._name = name
-        self._gatt = device.characteristic(PRIMARY_SERVICE, GATT_CHARACTERISTIC_UUIDS[name])
-        self._gatt.subscribe(self._recv)
-    def _recv(self, data : bytes):
-        print('debug', self._name, int.from_bytes(data[0:2], 'big'), [x for x in data[2:]])
+        super().__init__(device, 'gyroscope', GATT_CHARACTERISTIC_UUIDS['GYRO'], 0.0074768)
 
 
 class Telemetry:
@@ -243,21 +185,22 @@ class Telemetry:
     def __init__(self, device):
         self._gatt = device.characteristic(PRIMARY_SERVICE, GATT_CHARACTERISTIC_UUIDS['BATTERY'])
         self._gatt.subscribe(self._recv)
+        print("Broadcasting", "Telemetry")
+
     def _recv(self, data : bytes):
         seq = int.from_bytes(data[0:2], 'big', signed=False)
         # battery is expected to contain a mv field, an adc mv field, a data enabled flag, a percentage remaining
-        batt = Fraction(int.from_bytes(data[2:4], 'big', signed=False), 512)
-        fuelgaugemv = Fraction(int.from_bytes(data[4:6], 'big', signed=False) * 10, 22)
-        adcmv_maybe = int.from_bytes(data[6:8], 'big', signed=False)
+        batt = int.from_bytes(data[2:4], 'big', signed=False)/512
+        fuelgaugemv = (int.from_bytes(data[4:6], 'big', signed=False) * 10)/22
         temp = int.from_bytes(data[8:10], 'big', signed=False)
-        print('telemetry', {
+        print((json.dumps({
+            'name': 'telemetery',
             'seq': seq,
             'batt': float(batt),
             'fuelgauagemv': float(fuelgaugemv),
-            'adcmv_maybe': adcmv_maybe,
             'temp': temp,
             'unknown': [i for i in data[10:]]
-        })
+        })+EOL).encode('utf-8'), ('<broadcast>', 37020))
 
 class Ctrl:
     def __init__(self, device):
@@ -291,10 +234,11 @@ class Ctrl:
     def _recv(self, data : bytes):
         data = data[1:data[0]+1]
         self._data += data
-        if self._data[-1] == b'}'[0]:
+        if self._data[-1] == ord('}'):
             self._recvd.append(json.loads(self._data))
             self._resultevent.set()
             self._data = b''
+
     def send(self, data : str):
         print('SERIAL ->', data)
         self._resultevent = threading.Event()
@@ -333,18 +277,33 @@ print(ctrl.status())
 
 
 
-telemetry = Telemetry(device)
 
-#print('load')
-#debug= Debug(device, 'PPG_RED')
-eeg = Bits12(device, 'SIGNAL_FP2')
-#debug = Debug(device, 'THERMISTOR')
-#gyroscope = Gyroscope(device)
-#accelerometer = Accelerometer(device)
-#eeg = {
-#    name: Bits12(device, name, GATT_CHARACTERISTIC_UUIDS[name])
-#    for name, characteristic in GATT_CHARACTERISTIC_UUIDS.items()
-#    if name.startswith('SIGNAL_') or name == 'DRL_REF'
-#}
+# telemetry = Telemetry(device)
+gyroscope = Gyroscope(device)
+accelerometer = Accelerometer(device)
+eeg = {
+   name: Bits12(device, name)
+   for name, _ in GATT_CHARACTERISTIC_UUIDS.items()
+   if name.startswith('SIGNAL_') or name == 'DRL_REF'
+}
+
+ppg = {
+    name: Bits24(device, name) 
+    for name, _ in GATT_CHARACTERISTIC_UUIDS.items()
+    if name.startswith('PPG_')
+}
+
 print(ctrl.send('d')) # start streaming
-#bt_bluezero.pump()
+print("Started Broadcasting")
+
+
+
+while True:
+    try:
+        print(ctrl.send('k'))
+        time.sleep(1.5)
+    except KeyboardInterrupt as e:
+        print("Disconnecting...")
+        print(ctrl.send('h'))
+        del(device)
+        exit()        
